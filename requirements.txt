@@ -1,0 +1,6 @@
+chromadb
+google-genai
+python-dotenv
+streamlit
+groq
+statsmodels

@@ -1,0 +1,42 @@
+# Environment & secrets
+.env
+.env.*
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ChromaDB / vector database storage
+chroma_data/
+chroma_data_*/
+chroma/
+*.db
+
+# Models
+models/
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Datasets
+datasets/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
