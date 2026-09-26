@@ -1,15 +1,13 @@
 """
 streamlit_app.py
 
-A minimal chat UI around agent.py -- lets you type a message, see the
-reply, ask a follow-up, and watch memory persist across turns, all in
-a browser instead of the terminal.
+A chat UI around agent.py -- type a message, see the reply, watch
+memory persist across turns, all in a browser instead of the terminal.
 
-This does NOT change agent.py at all. It just wraps the existing
-Agent class. Once Gate v1/v2 exist, this same UI can be extended to
-show the "ungated vs. gated" side-by-side view mentioned in your
-implementation plan -- for now it's just a clean way to interact with
-what you already built.
+Includes a Gate toggle (Off / Gate v1) so you can demo the SAME
+poisoned document with the gate off vs. on, side by side, without
+restarting the app. Gate decisions are shown live, color-coded:
+green = auto_write, amber = quarantine, red = block.
 
 Run with:
     streamlit run streamlit_app.py
@@ -27,18 +25,31 @@ st.caption(
     "then asking about it in a later message."
 )
 
-# --- Session state setup -------------------------------------------------
-# `st.session_state` persists across reruns WITHIN one browser tab/session,
-# but a real Python process restart (or clicking "New session" below)
-# creates a brand new Agent object -- same idea as agent1 / agent2 in
-# agent.py's __main__ demo, just triggered from the UI instead of code.
+GATE_LABELS = {"Off (ungated baseline)": None, "Gate v1": "v1", "Gate v2 (origin binding)": "v2"}
 
+# --- Session state setup -------------------------------------------------
 if "agent" not in st.session_state:
-    st.session_state.agent = Agent(memory_path="./chroma_data_streamlit", session_id="ui-session-1")
-    st.session_state.messages = []  # what's shown on screen this session
+    st.session_state.agent = Agent(memory_path="./chroma_data_streamlit", session_id="ui-session-1", gate_version=None)
+    st.session_state.messages = []
     st.session_state.session_count = 1
+    st.session_state.gate_choice = "Off (ungated baseline)"
 
 with st.sidebar:
+    st.subheader("Gate")
+    gate_choice = st.radio(
+        "Write-path defense",
+        options=list(GATE_LABELS.keys()),
+        index=list(GATE_LABELS.keys()).index(st.session_state.gate_choice),
+        help="Off reproduces the original vulnerable baseline. Gate v1 adds "
+             "provenance + risk-classification checks before every write.",
+    )
+    st.session_state.gate_choice = gate_choice
+    # Cheap to set every rerun -- gate_version is just an attribute read
+    # inside _write_path, so flipping it doesn't require a new Agent
+    # object or losing memory/session state.
+    st.session_state.agent.gate_version = GATE_LABELS[gate_choice]
+
+    st.divider()
     st.subheader("Session controls")
     st.write(f"Current session: **ui-session-{st.session_state.session_count}**")
     st.caption(
@@ -52,14 +63,16 @@ with st.sidebar:
         st.session_state.agent = Agent(
             memory_path="./chroma_data_streamlit",
             session_id=f"ui-session-{st.session_state.session_count}",
+            gate_version=GATE_LABELS[st.session_state.gate_choice],
         )
         st.session_state.messages = []
         st.rerun()
 
     if st.button("Wipe all memory"):
-        st.session_state.agent.memory.reset()       # long-term (vector store)
-        st.session_state.agent.clear_short_term()    # short-term (chat history)
-        st.session_state.messages = []               # what's displayed on screen
+        # reset_all_memory() clears long-term store, quarantine store,
+        # AND short-term history + gate log in one call.
+        st.session_state.agent.reset_all_memory()
+        st.session_state.messages = []
         st.rerun()
 
     st.divider()
@@ -68,9 +81,31 @@ with st.sidebar:
     if stored:
         for m in stored:
             source = m["metadata"].get("source", "unknown")
-            st.markdown(f"- *{m['text']}*  \n  `source: {source}`")
+            origin = m["metadata"].get("origin")
+            origin_tag = f" · origin: {origin}" if origin else ""
+            st.markdown(f"- *{m['text']}*  \n  `source: {source}{origin_tag}`")
     else:
         st.caption("Nothing stored yet.")
+
+    quarantined = st.session_state.agent.quarantine.all_memories()
+    if quarantined:
+        st.subheader("Quarantined (held, not retrievable)")
+        for m in quarantined:
+            source = m["metadata"].get("source", "unknown")
+            st.warning(f"{m['text']}\n\nsource: {source}", icon="🟡")
+
+    if st.session_state.agent.gate_log:
+        st.divider()
+        st.subheader("Gate decisions this session")
+        # Most recent first, color-coded by action.
+        for entry in reversed(st.session_state.agent.gate_log[-8:]):
+            label = f"**{entry['action']}** — {entry['text']}\n\nsource: {entry['source']} · risk: {entry['risk']}"
+            if entry["action"] == "auto_write":
+                st.success(label, icon="🟢")
+            elif entry["action"] == "quarantine":
+                st.warning(label, icon="🟡")
+            elif entry["action"] == "block":
+                st.error(label, icon="🔴")
 
 # --- Chat history display -------------------------------------------------
 for msg in st.session_state.messages:

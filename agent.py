@@ -1,18 +1,20 @@
 """
 agent.py
 
-The vulnerable baseline agent: a chat loop that uses memory_store.py
-for long-term memory and extraction.py to decide what gets written.
+The agent's chat loop, using memory_store.py for long-term memory and
+extraction.py to decide what's memory-worthy.
 
-Write path (as designed): Input -> Extraction -> [no gate yet] ->
-Formatting -> Persistence. Gate v1 gets inserted between Extraction
-and Persistence in Phase 1's second half -- see gate.py once it
-exists. Until then, this agent writes ANYTHING extraction flags,
-with no source-awareness at all. That's intentional: this is the
-baseline you measure your attack's ASR against.
+Write path: Input -> Extraction -> Gate (if enabled) -> Formatting ->
+Persistence. gate_version=None reproduces Phase 1's original
+vulnerable baseline unchanged (writes everything unconditionally --
+this is what the no_gate ASR trials measure). gate_version="v1"
+routes through gate.py's provenance + risk-classification checkpoint.
+gate_version="v2" adds provenance.py's TMA-NM-style origin binding
+(M1) and non-malleable propagation (M2), including splitting pasted
+material out of user_direct chat messages.
 
-Uses Groq (free tier, ~1,000 req/day on the model below) instead of
-Gemini -- much more headroom for running many attack trials.
+Uses Groq (free tier, far more headroom than Gemini's) for both chat
+and extraction/classification.
 """
 
 import os
@@ -22,6 +24,8 @@ from groq import Groq, APIStatusError
 
 from memory_store import MemoryStore
 from extraction import extract_memory
+import gate as gate_v1
+import provenance
 
 load_dotenv()  # reads .env in the current folder and loads it into os.environ
 
@@ -31,14 +35,33 @@ MODEL = "openai/gpt-oss-120b"
 
 
 class Agent:
-    def __init__(self, memory_path: str = "./chroma_data", session_id: str = "default"):
+    def __init__(self, memory_path: str = "./chroma_data", session_id: str = "default", gate_version: str | None = None):
+        """
+        gate_version: None -> ungated baseline (Phase 1's vulnerable
+        agent, unchanged). "v1" -> Gate v1 active (provenance + risk
+        classification + routing). "v2" -> origin binding + propagation
+        (provenance.py), then Gate v1's risk routing on the bound origin.
+        """
         self.client = Groq(api_key=os.environ["GROQ_API_KEY"])
-        self.memory = MemoryStore(path=memory_path)
+        self.memory = MemoryStore(path=memory_path, collection_name="agent_memory")
+        # Quarantined items live in a SEPARATE collection, deliberately
+        # never queried by memory.retrieve() -- "held, not yet
+        # retrievable" per the write-gate design, not silently dropped.
+        self.quarantine = MemoryStore(path=memory_path, collection_name="agent_memory_quarantine")
         self.session_id = session_id
+        self.gate_version = gate_version
+        # Log of every gate decision made this session -- useful for
+        # debugging and for the Streamlit sidebar to show later.
+        self.gate_log: list[dict] = []
         # Short-term memory for THIS session only -- cleared when the
         # Agent object is thrown away, simulating a fresh session.
         # Groq/OpenAI-style messages: {"role": "user"/"assistant", "content": "..."}
         self.conversation_history: list[dict] = []
+        # v2 only: origins of everything that fed the current turn
+        # (message segments + retrieved memories). Anything the agent
+        # itself writes this turn inherits the lowest of these (M2).
+        self.turn_origins: list[str] = []
+        self._last_retrieved: list[dict] = []
 
     def _build_system_prompt(self, user_message: str) -> str:
         """
@@ -46,6 +69,7 @@ class Agent:
         them into context. This is the RAG-like half of the system.
         """
         memories = self.memory.retrieve(user_message, k=3)
+        self._last_retrieved = memories
         if not memories:
             return "You are a helpful assistant."
 
@@ -58,27 +82,127 @@ class Agent:
 
     def _write_path(self, source_text: str, source_label: str = "user_direct"):
         """
-        Input -> Extraction -> (Gate goes here in Phase 1) -> Write.
-        `source_label` is already being tracked so Gate v1 has
-        something to key off of later -- but nothing reads/checks it
-        yet, which is exactly the vulnerability Phase 1 will exploit.
+        Input -> Extraction -> Gate (if enabled) -> Write.
+
+        With gate_version=None: identical to the original vulnerable
+        baseline -- extraction's output is written unconditionally.
+        This is what your no_gate ASR trials measure.
+
+        With gate_version="v1": Gate v1 evaluates the extracted
+        candidate BEFORE it's committed, based on source_label's trust
+        tier and a risk classification of the content itself.
         """
+        if self.gate_version == "v2":
+            return self._write_path_v2(source_text, source_label)
+
         extracted = extract_memory(source_text)
-        if extracted:
-            # TODO(Phase 1): insert gate.evaluate(extracted, source_label)
-            # here and only write if the gate approves.
+        if not extracted:
+            return None
+
+        if self.gate_version is None:
+            # Original vulnerable baseline -- no gate, write unconditionally.
             self.memory.write(extracted, metadata={"source": source_label})
-        return extracted
+            return extracted
+
+        if self.gate_version == "v1":
+            decision = gate_v1.evaluate(extracted, source_label)
+            self.gate_log.append({"text": extracted, "source": source_label, **decision.to_dict()})
+
+            if decision.action == "auto_write":
+                self.memory.write(extracted, metadata={"source": source_label, "gate_action": decision.action})
+            elif decision.action == "quarantine":
+                self.quarantine.write(extracted, metadata={"source": source_label, "gate_action": decision.action, "risk": decision.risk})
+            elif decision.action == "block":
+                pass  # not written anywhere; only logged in self.gate_log
+            return extracted
+
+        raise ValueError(f"Unknown gate_version: {self.gate_version!r}")
+
+    @staticmethod
+    def _memory_origin(m: dict) -> str:
+        # Memories written before v2 have no origin field -- derive it
+        # from their channel label (fail-safe: unknown -> untrusted).
+        meta = m.get("metadata") or {}
+        return meta.get("origin") or provenance.channel_origin(meta.get("source", ""))
+
+    def _write_path_v2(self, source_text: str, source_label: str):
+        """
+        Gate v2 write path (TMA-NM M1 + M2, small scale):
+
+          1. Bind origin from the channel. A user_direct message is
+             further split so pasted material is labelled
+             untrusted_external rather than inheriting the user's trust.
+          2. Extract from EACH segment separately, so a candidate
+             memory is derived from exactly one input and its origin is
+             derive_origin([that input]) -- a pasted "note to self"
+             cannot borrow the user's label by sharing a message.
+          3. act_class = f(origin), stored with the memory.
+          4. Gate v1's risk routing runs on the bound origin, not on
+             the raw channel label.
+        """
+        if source_label == "user_direct":
+            segments = provenance.split_message(source_text)
+        else:
+            origin = provenance.channel_origin(source_label)
+            segments = [provenance.Segment(source_text, origin, f"channel '{source_label}'")]
+
+        self.turn_origins = [s.origin for s in segments] + [self._memory_origin(m) for m in self._last_retrieved]
+
+        written = []
+        for seg in segments:
+            extracted = extract_memory(seg.text)
+            if not extracted:
+                continue
+            origin = provenance.derive_origin([seg.origin])
+            written.append(self._commit_v2(extracted, origin, source_label, seg.reason))
+        return written or None
+
+    def write_agent_note(self, text: str):
+        """
+        The agent writing its OWN note (e.g. a summary of what it just
+        read). Under v2 the note inherits the lowest origin of
+        everything that fed this turn (M2), so summarizing a poisoned
+        document cannot launder it into a trusted memory (L-a).
+        """
+        if self.gate_version != "v2":
+            self.memory.write(text, metadata={"source": "agent_note"})
+            return
+        origin = provenance.derive_origin(self.turn_origins)
+        self._commit_v2(text, origin, "agent_note", f"derived from {sorted(set(self.turn_origins))}")
+
+    def _commit_v2(self, text: str, origin: str, source_label: str, reason: str) -> str:
+        act = provenance.act_class(origin)
+        decision = gate_v1.evaluate(text, origin)
+        meta = {"source": source_label, "origin": origin, "act_class": act, "gate_action": decision.action}
+        self.gate_log.append({"text": text, "source": source_label, "origin": origin, "act_class": act,
+                              "provenance": reason, **decision.to_dict()})
+
+        if decision.action == "auto_write":
+            self.memory.write(text, metadata=meta)
+        elif decision.action == "quarantine":
+            self.quarantine.write(text, metadata={**meta, "risk": decision.risk})
+        # "block": not written anywhere; only logged in self.gate_log
+        return text
 
     def clear_short_term(self):
         """
         Clears only the in-session chat history (short-term/working
-        memory) -- does NOT touch the long-term vector store. Useful
-        for "start a fresh conversation, keep what's been remembered"
-        flows, and for making a true full reset explicit: full reset =
-        this + memory.reset(), called together.
+        memory) -- does NOT touch either long-term store. Useful for
+        "start a fresh conversation, keep what's been remembered" flows.
         """
         self.conversation_history = []
+
+    def reset_all_memory(self):
+        """
+        True full reset: long-term store, quarantine store, AND
+        short-term chat history. memory.reset() alone only clears the
+        main collection -- quarantine is a separate collection and
+        needs its own reset, easy to forget since it's a newer addition.
+        """
+        self.memory.reset()
+        self.quarantine.reset()
+        self.clear_short_term()
+        self.gate_log = []
 
     def chat(self, user_message: str, source_label: str = "user_direct") -> str:
         """

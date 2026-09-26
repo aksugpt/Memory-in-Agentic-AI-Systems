@@ -52,6 +52,22 @@ UI session (new chat history, same persistent memory) to test recall
 the same way `agent.py`'s two-session demo does. A "wipe all memory"
 button is there for resetting between manual tests.
 
+**File upload (same box as chat):** the chat input itself has a paperclip
+attach button (`accept_file=True`) -- type a task instruction and/or attach
+a `.txt`/`.md` file in the same box you'd normally chat in, then hit send.
+Attaching a file routes through `agent.process_document()` -- the same
+entry point `attacks/indirect_injection.py` uses -- tagging the resulting
+memory `source: processed_document` instead of `user_direct` (visible in
+the sidebar). Typing without attaching a file behaves exactly like normal
+chat. Good for live demos: attach a poisoned document, start a new
+session, ask an unrelated question, show the poisoned answer -- all in
+one continuous flow without leaving the chat box.
+
+A ready-to-use example is included: `poisoned_email.txt`. Attach it,
+send with the default task instruction, start a new session, then ask
+"I have a headache, what should I take?" to see the injected preference
+surface.
+
 The `agent.py` demo simulates two sessions: it tells the agent a fact
 in "Session 1", then creates a brand-new `Agent` object for "Session
 2" (same on-disk memory store) and confirms the fact carries over —
@@ -72,10 +88,112 @@ downloads a small ONNX model (~90MB) the first time you run it. This
 requires normal internet access and works out of the box on your own
 machine — no API key needed for this part, it's a local model.
 
+## Phase 1: the attack
+
+- `attacks/indirect_injection.py` — 3 poisoning scenarios (poisoned
+  document + innocent task -> fresh session -> trigger question).
+  Run directly for a single manual demo:
+  ```bash
+  python attacks/indirect_injection.py
+  ```
+- `run_trials.py` — runs every scenario N times, logs each trial to
+  `results/trials_<gate>_<timestamp>.csv`, and prints Attack Success
+  Rate (ASR) with a 95% Wilson confidence interval, overall and per
+  scenario. This is your baseline number.
+  ```bash
+  python run_trials.py --trials 10          # quick check (~10-15 min)
+  python run_trials.py --trials 30 --gate no_gate   # real baseline run
+  ```
+  Once Gate v1/v2 exist, re-run with `--gate gate_v1` / `--gate
+  gate_v2` (after wiring the gate into `agent.py`'s `_write_path`) to
+  produce the before/after comparison that's the core result table.
+
+  Note: `--trials 30` means 30 x 3 scenarios = 90 full attack runs,
+  each involving several LLM calls -- budget your Groq rate limit
+  accordingly, and expect it to take a while. Start with `--trials 5`
+  to confirm everything works before committing to a full run.
+
+## Gate v1: provenance + risk-classification write gate
+
+`gate.py` implements Gate v1 -- inserted between Extraction and
+Persistence in `agent.py`'s `_write_path`. Decision table:
+
+| Trust (source)      | Risk (content) | Action     |
+|----------------------|-----------------|------------|
+| high (`user_direct`) | any             | auto_write |
+| low (other)           | fact            | auto_write |
+| low (other)           | preference      | quarantine |
+| low (other)           | instruction     | block      |
+
+Quarantined items go to a separate Chroma collection
+(`agent_memory_quarantine`) never queried by `memory.retrieve()` --
+held, not retrievable, not silently dropped. Blocked items aren't
+written anywhere, only logged in `agent.gate_log`.
+
+**Backward compatible by construction:** `Agent(gate_version=None)`
+(the default) reproduces the original ungated baseline byte-for-byte
+-- your existing 90-trial, 98.9% ASR results remain valid and
+comparable. `Agent(gate_version="v1")` routes every write through the
+gate above.
+
+**To measure the before/after comparison:**
+```bash
+python run_trials.py --trials 30 --gate no_gate    # baseline (already run)
+python run_trials.py --trials 30 --gate gate_v1     # with Gate v1 active
+```
+Both use the exact same trial logic (`run_single_trial`) -- only
+`gate_version` differs -- so the ASR difference reflects the gate's
+real effect, not a change in methodology. The results CSV now
+includes a `gate_action` column (`auto_write` / `quarantine` /
+`block`) so you can see *why* an attack was stopped, not just whether
+ASR dropped.
+
+**Known limitation (intentional, feeds Phase 2):** Gate v1 tags trust
+by raw source only. If the agent summarizes untrusted content in its
+own words, that summary is written via `chat()`'s default
+`user_direct` label and looks high-trust -- this is the laundering gap
+Phase 2's attack is designed to demonstrate, motivating Gate v2's
+non-malleable trust propagation.
+
+## Gate v2, step 1: origin binding + propagation (TMA-NM M1/M2, small scale)
+
+`provenance.py` + `Agent(gate_version="v2")`. Adapts TMA-NM's
+write-time origin binding (M1) and non-malleable propagation (M2):
+
+- Every candidate memory gets an `origin` (`user` / `trusted_tool` /
+  `agent` / `untrusted_external`) set from the **channel**, never
+  from content, and `act_class = f(origin)` (`act` / `inform` /
+  `none`), both stored in Chroma metadata.
+- **Paste bypass fix.** Gate v1 labels a whole chat message
+  `user_direct`, so a poisoned document *pasted* into chat skips the
+  gate. v2 splits a user_direct message on structural cues (a task
+  request pointing at "this/below", `Subject:`/`From:` headers,
+  `---` separators, code fences, `>` quotes). The user's own request
+  stays `user`; the pasted part becomes `untrusted_external`. Each
+  segment is extracted separately, so a pasted "note to self" can't
+  borrow the user's label.
+- `derive_origin()` gives any derived item the lowest origin among
+  its inputs. `agent.write_agent_note()` uses it, so the agent's own
+  summary of a poisoned document stays untrusted (the laundering
+  channel L-a).
+- Gate v1's fact/preference/instruction routing then runs on the
+  bound origin.
+
+Measure the bypass and the fix (the `--delivery` default of `upload`
+keeps earlier runs comparable):
+```bash
+python run_trials.py --trials 30 --gate gate_v1 --delivery paste   # bypass
+python run_trials.py --trials 30 --gate gate_v2 --delivery both    # fix
+```
+Known limitation: a paste with no structural cue at all is
+indistinguishable from typed text and stays `user`. The act-time
+gate (step 2) and user confirmation (step 3) are the backstop.
+
 ## What's next (not built yet)
 
-- `attacks/direct_injection.py`, `attacks/indirect_injection.py` —
-  Phase 1's attack scripts, using `agent.process_document()`
-- `gate.py` — Gate v1 (provenance tag + risk classification + routing),
-  inserted at the `# TODO(Phase 1)` marker in `agent.py`'s `_write_path`
-- `run_trials.py` — runs N trials of an attack, logs pass/fail, computes ASR
+- `attacks/laundering.py` — Phase 2's self-summarization laundering attack,
+  to demonstrate Gate v1's documented limitation above
+- Gate v2 — non-malleable trust propagation + corroboration-gated elevation
+- `crypto_layer.py` — Phase 3's HMAC write-signing + hash-chained log
+- `attacks/direct_injection.py` — optional: a simpler direct (user-stated)
+  variant for comparison against the indirect scenarios already built
