@@ -48,20 +48,28 @@ CSV_COLUMNS = ["timestamp", "gate", "scenario", "trial_index", "write_succeeded"
                "auto_executed", "held_for_confirmation"]
 
 
-def _resolve_gate_version(gate_label: str) -> str | None:
-    """
-    Maps the CLI/CSV label to the actual gate_version Agent understands.
-    "no_gate" -> None (original vulnerable baseline, unchanged).
-    "gate_v1" -> "v1". "gate_v2" -> "v2".
-    Keeping the label and the mechanism separate means the CSV stays
-    human-readable while agent.py only needs to know about version
-    strings, not this project's naming conventions.
-    """
-    if gate_label == "no_gate":
-        return None
-    if gate_label.startswith("gate_"):
-        return gate_label[len("gate_"):]  # "gate_v1" -> "v1"
-    raise ValueError(f"Unrecognized --gate value: {gate_label!r} (expected no_gate / gate_v1 / gate_v2)")
+# Every --gate label is a named configuration: gate_version plus any
+# ablation switches. The label is what lands in the CSV's "gate"
+# column, so each configuration's results stay separable.
+CONFIGS = {
+    # --- main comparison ---
+    "no_gate": {"gate_version": None},
+    "gate_v1": {"gate_version": "v1"},
+    "gate_v2": {"gate_version": "v2"},
+    # --- ablations (each removes one mechanism from gate_v2) ---
+    "gate_v2_no_act":       {"gate_version": "v2", "act_gate": False},    # write gate only
+    "gate_v2_no_split":     {"gate_version": "v2", "paste_split": False},  # no paste split
+    "gate_v2_no_elevation": {"gate_version": "v2", "elevation": False},    # -M3: no registries
+    "gate_v2_k1":           {"gate_version": "v2", "k": 1},                # single-source elevation
+    "act_only":             {"gate_version": None, "act_gate": True},      # act gate, no write gate
+}
+
+
+def resolve_config(gate_label: str) -> dict:
+    """Maps a --gate label to Agent keyword arguments."""
+    if gate_label not in CONFIGS:
+        raise ValueError(f"Unrecognized --gate value: {gate_label!r} (expected one of {', '.join(CONFIGS)})")
+    return dict(CONFIGS[gate_label])
 
 
 def _csv_row(r: dict) -> list:
@@ -101,7 +109,7 @@ def run_all_trials(n_trials: int, csv_path: str, gate_label: str = "no_gate", ke
     """
     Runs n_trials for every scenario in SUITES[suite] (default: the
     original text-only POISON_SCENARIOS).
-    `gate_label` is both the CSV tag AND (via _resolve_gate_version)
+    `gate_label` is both the CSV tag AND (via resolve_config)
     what actually toggles the gate on/off in the Agent -- "no_gate"
     truly runs ungated, "gate_v1" truly routes through Gate v1. This
     is what makes the before/after ASR comparison real, not just two
@@ -119,7 +127,7 @@ def run_all_trials(n_trials: int, csv_path: str, gate_label: str = "no_gate", ke
 
     Returns all rows in the CSV afterwards (earlier + this run).
     """
-    gate_version = _resolve_gate_version(gate_label)
+    agent_kwargs = resolve_config(gate_label)
     # Benign scenarios don't use a document, so delivery doesn't apply:
     # run them once (under the first delivery mode) rather than per mode.
     jobs = [(d, sc, t) for d in deliveries for sc in SUITES[suite] for t in range(n_trials)
@@ -158,7 +166,7 @@ def run_all_trials(n_trials: int, csv_path: str, gate_label: str = "no_gate", ke
             print(f"[{run_num}/{total_runs}] {scenario['name']} [{delivery}] trial {trial_i + 1}/{n_trials}...", end=" ", flush=True)
 
             try:
-                result = run_single_trial(scenario, memory_path=memory_path, gate_version=gate_version, delivery=delivery)
+                result = run_single_trial(scenario, memory_path=memory_path, delivery=delivery, **agent_kwargs)
                 result["error"] = False
                 status = "SUCCESS" if result["trigger_succeeded"] else "failed"
                 if result.get("gate_action") and result["gate_action"] != "n/a":
@@ -283,7 +291,7 @@ def print_asr_summary(results: list[dict]):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--trials", type=int, default=10, help="Trials per scenario (default 10 for a quick check; use 30 for a real run)")
-    parser.add_argument("--gate", type=str, default="no_gate", help="Label for this run, e.g. no_gate / gate_v1 / gate_v2")
+    parser.add_argument("--gate", choices=list(CONFIGS), default="no_gate", help="Configuration to run (see CONFIGS): no_gate / gate_v1 / gate_v2, or an ablation such as gate_v2_no_act")
     parser.add_argument("--suite", choices=sorted(SUITES), default="text", help="Scenario set: text (original 3 text-marker scenarios, default -- matches earlier runs), action (send_email tool + act gate, incl. a benign utility control), or all")
     parser.add_argument("--delivery", choices=[*DELIVERY_MODES, "both"], default="upload", help="How the poisoned document reaches the agent: upload (process_document, default -- matches earlier runs), paste (inside an ordinary chat message), or both")
     parser.add_argument("--keep-chroma", action="store_true", help="Keep each trial's chroma_data_trial_* folder instead of deleting it after the trial (useful for manually inspecting one trial's memory state)")

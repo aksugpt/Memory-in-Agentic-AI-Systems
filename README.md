@@ -291,6 +291,31 @@ the paper's **uncorr-auto** metric (lower is safer).
 Trial folders, including their logs, are still deleted after each
 trial. Use `--keep-chroma` to keep them and verify a trial's chain.
 
+## Step 5: ablations + results table
+
+Every `--gate` value is a named configuration in `run_trials.CONFIGS`:
+
+| `--gate` | what it is |
+|---|---|
+| `no_gate` / `gate_v1` / `gate_v2` | main comparison |
+| `gate_v2_no_act` | write gate only, no act gate |
+| `act_only` | act gate only, no write gate (origins from channel labels) |
+| `gate_v2_no_split` | v2 without the paste split |
+| `gate_v2_no_elevation` | no trusted registries (the paper's -M3; costs utility) |
+| `gate_v2_k1` | a single trusted source is enough (the insecure point) |
+
+`python make_results_table.py` reads every `results/trials_*.csv` and
+writes `results/summary_table.{md,csv}`: ASR with Wilson CIs, a Fisher
+exact p against `no_gate` on the same suite and delivery, legit
+utility, and uncorr-auto. Each group uses its single most complete
+file (never pooled). Older files are listed underneath (`--all-files`
+shows them all, `--detail` adds per-scenario rows).
+
+Note on the Aug 16 `no_gate` runs: the 17:07 run hit the daily quota
+after 39 trials, and the runner of that time counted the 51
+rate-limit errors as failed attacks, so it looked like 39/90. Of the
+trials that ran, 39/39 succeeded, consistent with the 89/90 run.
+
 ## What's next (not built yet)
 
 - `attacks/laundering.py` — Phase 2's self-summarization laundering attack,

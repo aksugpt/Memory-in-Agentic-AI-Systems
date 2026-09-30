@@ -40,7 +40,8 @@ MODEL = "openai/gpt-oss-120b"
 
 class Agent:
     def __init__(self, memory_path: str = "./chroma_data", session_id: str = "default", gate_version: str | None = None,
-                 tools: bool = False, act_gate: bool | None = None):
+                 tools: bool = False, act_gate: bool | None = None,
+                 paste_split: bool = True, k: int = 2, elevation: bool = True):
         """
         gate_version: None -> ungated baseline (Phase 1's vulnerable
         agent, unchanged). "v1" -> Gate v1 active (provenance + risk
@@ -54,6 +55,14 @@ class Agent:
         act_gate: run act_gate.py's Algorithm 1 on every tool call.
         Defaults to on for v2 and off otherwise; pass it explicitly
         for ablations (e.g. v2 write gate without the act gate).
+
+        Ablation switches (defaults = the full design):
+          paste_split -- v2 splits pasted material out of user_direct
+                         messages (off: whole message keeps the channel label)
+          k           -- independent trusted domains needed to elevate
+                         an untrusted value (k=1 is the insecure single-source point)
+          elevation   -- consult the trusted registries at all (off:
+                         every untrusted value needs user confirmation)
         """
         self.client = Groq(api_key=os.environ["GROQ_API_KEY"])
         self.memory = MemoryStore(path=memory_path, collection_name="agent_memory")
@@ -77,6 +86,9 @@ class Agent:
         self._last_retrieved: list[dict] = []
         self.tools = tools
         self.act_gate_enabled = (gate_version == "v2") if act_gate is None else act_gate
+        self.paste_split = paste_split
+        self.k = k
+        self.elevation = elevation
         # Every tool call the model proposed, with the act gate's verdict
         # and whether it executed. outbox = calls that actually executed.
         self.action_log: list[dict] = []
@@ -178,7 +190,7 @@ class Agent:
           4. Gate v1's risk routing runs on the bound origin, not on
              the raw channel label.
         """
-        if source_label == "user_direct":
+        if source_label == "user_direct" and self.paste_split:
             segments = provenance.split_message(source_text)
         else:
             origin = provenance.channel_origin(source_label)
@@ -258,7 +270,7 @@ class Agent:
         origin. Only v2 splits pasted material out of a user_direct
         message; without v2 the whole message carries its channel label.
         """
-        if source_label == "user_direct" and self.gate_version == "v2":
+        if source_label == "user_direct" and self.gate_version == "v2" and self.paste_split:
             segments = provenance.split_message(user_message)
         else:
             segments = [provenance.Segment(user_message, provenance.channel_origin(source_label), "channel")]
@@ -278,7 +290,7 @@ class Agent:
         verdict = None
         context = self._act_context(user_message, source_label)
         if self.act_gate_enabled:
-            verdict = act_gate.authorize(name, args, context, authorizer=self.authorizer)
+            verdict = act_gate.authorize(name, args, context, authorizer=self.authorizer, **self._act_gate_kwargs())
         known = name in act_gate.SECURITY_FIELDS
         executed = known and (verdict is None or verdict.allowed)
 
@@ -299,6 +311,12 @@ class Agent:
                     f"{verdict.unlicensed_values} came from an untrusted source and is not independently verified]")
         return f"[{name}: unknown tool, not executed]"
 
+    def _act_gate_kwargs(self) -> dict:
+        kwargs = {"k": self.k}
+        if not self.elevation:
+            kwargs["registries"] = []  # no trusted corroborators at all
+        return kwargs
+
     def confirm_pending(self, pending_id: int) -> str:
         """
         The USER approves one held action (UI Confirm button, or the
@@ -311,7 +329,8 @@ class Agent:
         if p["state"] != "pending":
             return f"[#{pending_id} already {p['state']}]"
         token = self.authorizer.issue(p["tool"], p["args"])
-        verdict = act_gate.authorize(p["tool"], p["args"], p["context"], authorizer=self.authorizer, token=token)
+        verdict = act_gate.authorize(p["tool"], p["args"], p["context"], authorizer=self.authorizer, token=token,
+                                     **self._act_gate_kwargs())
         executed = verdict.allowed
         p["state"] = "confirmed" if executed else "failed"
         self._audit("user_confirmation", {"pending_id": pending_id, "tool": p["tool"], "args": p["args"],

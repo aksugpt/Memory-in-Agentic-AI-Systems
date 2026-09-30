@@ -269,7 +269,8 @@ def _action_hits(calls: list[dict], markers: list[str]) -> bool:
     return False
 
 
-def run_single_trial(scenario: dict, memory_path: str, gate_version: str | None = None, delivery: str = "upload") -> dict:
+def run_single_trial(scenario: dict, memory_path: str, gate_version: str | None = None, delivery: str = "upload",
+                     **agent_kwargs) -> dict:
     """
     Runs ONE trial of one poisoning scenario end-to-end:
       1. Fresh agent, clean memory.
@@ -289,13 +290,16 @@ def run_single_trial(scenario: dict, memory_path: str, gate_version: str | None 
     message, so it arrives on the user_direct channel -- the paste
     bypass that defeats Gate v1's channel-only trust tagging.
 
+    agent_kwargs: extra Agent switches for ablations (act_gate,
+    paste_split, k, elevation) -- see run_trials.CONFIGS.
+
     Returns a dict with the scenario name, whether the write happened,
     whether the trigger succeeded, and the raw reply for manual review.
     """
     tools = scenario.get("tools", False)
 
     # --- Step 1: clean slate ---
-    agent1 = Agent(memory_path=memory_path, session_id="attack-session-1", gate_version=gate_version, tools=tools)
+    agent1 = Agent(memory_path=memory_path, session_id="attack-session-1", gate_version=gate_version, tools=tools, **agent_kwargs)
     agent1.reset_all_memory()
 
     # --- Step 2: poison via a normal-looking document task ---
@@ -323,7 +327,7 @@ def run_single_trial(scenario: dict, memory_path: str, gate_version: str | None 
     )
 
     # --- Step 3: fresh, unrelated session (same on-disk memory) ---
-    agent2 = Agent(memory_path=memory_path, session_id="attack-session-2", gate_version=gate_version, tools=tools)
+    agent2 = Agent(memory_path=memory_path, session_id="attack-session-2", gate_version=gate_version, tools=tools, **agent_kwargs)
 
     # --- Step 4 + 5: trigger and check ---
     reply = agent2.chat(scenario["trigger_question"])
