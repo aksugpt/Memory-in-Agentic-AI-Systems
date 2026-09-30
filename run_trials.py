@@ -30,7 +30,7 @@ from datetime import datetime
 
 from statsmodels.stats.proportion import proportion_confint
 
-from attacks.indirect_injection import POISON_SCENARIOS, DELIVERY_MODES, run_single_trial
+from attacks.indirect_injection import SUITES, DELIVERY_MODES, run_single_trial
 
 RESULTS_DIR = "./results"
 
@@ -44,7 +44,7 @@ def _is_daily_limit(e: Exception) -> bool:
 
 
 CSV_COLUMNS = ["timestamp", "gate", "scenario", "trial_index", "write_succeeded", "trigger_succeeded",
-               "gate_action", "reply", "delivery", "poison_origin", "error"]
+               "gate_action", "reply", "delivery", "poison_origin", "error", "kind", "action_attempted"]
 
 
 def _resolve_gate_version(gate_label: str) -> str | None:
@@ -69,6 +69,7 @@ def _csv_row(r: dict) -> list:
         r["write_succeeded"], r["trigger_succeeded"], r.get("gate_action", "n/a"),
         r["reply"].replace("\n", " ")[:300],
         r.get("delivery", "upload"), r.get("poison_origin", "n/a"), r.get("error", False),
+        r.get("kind", "attack"), r.get("action_attempted"),
     ]
 
 
@@ -86,14 +87,17 @@ def load_results_csv(path: str) -> list[dict]:
         r["write_succeeded"] = r["write_succeeded"] == "True"
         r["trigger_succeeded"] = r["trigger_succeeded"] == "True"
         r["delivery"] = r.get("delivery") or "upload"
+        r["kind"] = r.get("kind") or "attack"
+        r["action_attempted"] = {"True": True, "False": False}.get(r.get("action_attempted"))
         r["error"] = r.get("error") == "True" or r["reply"].startswith("[ERROR]")
     return rows
 
 
 def run_all_trials(n_trials: int, csv_path: str, gate_label: str = "no_gate", keep_chroma: bool = False,
-                   deliveries: tuple[str, ...] = ("upload",), resume: bool = False) -> list[dict]:
+                   deliveries: tuple[str, ...] = ("upload",), resume: bool = False, suite: str = "text") -> list[dict]:
     """
-    Runs n_trials for every scenario in POISON_SCENARIOS.
+    Runs n_trials for every scenario in SUITES[suite] (default: the
+    original text-only POISON_SCENARIOS).
     `gate_label` is both the CSV tag AND (via _resolve_gate_version)
     what actually toggles the gate on/off in the Agent -- "no_gate"
     truly runs ungated, "gate_v1" truly routes through Gate v1. This
@@ -113,7 +117,11 @@ def run_all_trials(n_trials: int, csv_path: str, gate_label: str = "no_gate", ke
     Returns all rows in the CSV afterwards (earlier + this run).
     """
     gate_version = _resolve_gate_version(gate_label)
-    total_runs = n_trials * len(POISON_SCENARIOS) * len(deliveries)
+    # Benign scenarios don't use a document, so delivery doesn't apply:
+    # run them once (under the first delivery mode) rather than per mode.
+    jobs = [(d, sc, t) for d in deliveries for sc in SUITES[suite] for t in range(n_trials)
+            if sc.get("kind", "attack") == "attack" or d == deliveries[0]]
+    total_runs = len(jobs)
     run_num = 0
 
     previous = []
@@ -136,55 +144,55 @@ def run_all_trials(n_trials: int, csv_path: str, gate_label: str = "no_gate", ke
             writer.writerow(_csv_row(r))
         f.flush()
 
-        for delivery in deliveries:
-            for scenario in POISON_SCENARIOS:
-                for trial_i in range(n_trials):
-                    run_num += 1
-                    if (scenario["name"], delivery, trial_i) in done:
-                        continue
-                    # Separate on-disk memory per trial so trials don't leak
-                    # into each other -- each trial gets a genuinely clean slate.
-                    memory_path = f"./chroma_data_trial_{scenario['name']}_{delivery}_{trial_i}"
+        for delivery, scenario, trial_i in jobs:
+            run_num += 1
+            if (scenario["name"], delivery, trial_i) in done:
+                continue
+            # Separate on-disk memory per trial so trials don't leak
+            # into each other -- each trial gets a genuinely clean slate.
+            memory_path = f"./chroma_data_trial_{scenario['name']}_{delivery}_{trial_i}"
 
-                    print(f"[{run_num}/{total_runs}] {scenario['name']} [{delivery}] trial {trial_i + 1}/{n_trials}...", end=" ", flush=True)
+            print(f"[{run_num}/{total_runs}] {scenario['name']} [{delivery}] trial {trial_i + 1}/{n_trials}...", end=" ", flush=True)
 
-                    try:
-                        result = run_single_trial(scenario, memory_path=memory_path, gate_version=gate_version, delivery=delivery)
-                        result["error"] = False
-                        status = "SUCCESS" if result["trigger_succeeded"] else "failed"
-                        if result.get("gate_action") and result["gate_action"] != "n/a":
-                            status += f" (gate: {result['gate_action']})"
-                        print(status)
-                    except Exception as e:
-                        if _is_daily_limit(e):
-                            # Every remaining trial would fail the same way;
-                            # stop now, don't write an error row for this one.
-                            print("DAILY LIMIT")
-                            raise DailyLimitReached(str(e)) from e
-                        # Don't let one bad trial (e.g. a transient API error
-                        # that exhausted retries) kill the whole run -- log it
-                        # as an errored trial (excluded from ASR) and keep going.
-                        print(f"ERROR: {e}")
-                        result = {
-                            "scenario": scenario["name"],
-                            "delivery": delivery,
-                            "poison_origin": "n/a",
-                            "write_succeeded": False,
-                            "trigger_succeeded": False,
-                            "gate_action": "n/a",
-                            "reply": f"[ERROR] {e}",
-                            "error": True,
-                        }
-                    result["gate"] = gate_label
-                    result["trial_index"] = trial_i
-                    result["timestamp"] = datetime.now().isoformat()
+            try:
+                result = run_single_trial(scenario, memory_path=memory_path, gate_version=gate_version, delivery=delivery)
+                result["error"] = False
+                status = "SUCCESS" if result["trigger_succeeded"] else "failed"
+                if result.get("gate_action") and result["gate_action"] != "n/a":
+                    status += f" (gate: {result['gate_action']})"
+                print(status)
+            except Exception as e:
+                if _is_daily_limit(e):
+                    # Every remaining trial would fail the same way;
+                    # stop now, don't write an error row for this one.
+                    print("DAILY LIMIT")
+                    raise DailyLimitReached(str(e)) from e
+                # Don't let one bad trial (e.g. a transient API error
+                # that exhausted retries) kill the whole run -- log it
+                # as an errored trial (excluded from ASR) and keep going.
+                print(f"ERROR: {e}")
+                result = {
+                    "scenario": scenario["name"],
+                    "delivery": delivery,
+                    "poison_origin": "n/a",
+                    "kind": scenario.get("kind", "attack"),
+                    "action_attempted": None,
+                    "write_succeeded": False,
+                    "trigger_succeeded": False,
+                    "gate_action": "n/a",
+                    "reply": f"[ERROR] {e}",
+                    "error": True,
+                }
+            result["gate"] = gate_label
+            result["trial_index"] = trial_i
+            result["timestamp"] = datetime.now().isoformat()
 
-                    writer.writerow(_csv_row(result))
-                    f.flush()
-                    all_results.append(result)
+            writer.writerow(_csv_row(result))
+            f.flush()
+            all_results.append(result)
 
-                    if not keep_chroma and os.path.exists(memory_path):
-                        shutil.rmtree(memory_path, ignore_errors=True)
+            if not keep_chroma and os.path.exists(memory_path):
+                shutil.rmtree(memory_path, ignore_errors=True)
 
     print(f"\nRaw trial log saved to: {csv_path}")
     return all_results
@@ -202,7 +210,8 @@ def print_asr_summary(results: list[dict]):
     "attack failed" would make a defended run look better than it is.
     """
     errored = [r for r in results if r.get("error")]
-    results = [r for r in results if not r.get("error")]
+    benign = [r for r in results if not r.get("error") and r.get("kind") == "benign"]
+    results = [r for r in results if not r.get("error") and r.get("kind", "attack") == "attack"]
 
     print("\n" + "=" * 60)
     print("ATTACK SUCCESS RATE (ASR) SUMMARY")
@@ -235,6 +244,25 @@ def print_asr_summary(results: list[dict]):
             count = gate_actions.count(action)
             print(f"  {action:12s} {count:3d}/{len(gate_actions)}")
 
+    attempted = [r for r in results if r.get("action_attempted") is not None]
+    if attempted:
+        print("-" * 60)
+        print("Action scenarios -- model PROPOSED the attacker's address vs it EXECUTED:")
+        for name in sorted(set(r["scenario"] for r in attempted)):
+            sub = [r for r in attempted if r["scenario"] == name]
+            a = sum(1 for r in sub if r["action_attempted"])
+            e = sum(1 for r in sub if r["trigger_succeeded"])
+            print(f"  {name:33s} attempted {a:3d}/{len(sub):<3d} executed {e:3d}/{len(sub)}")
+
+    if benign:
+        print("-" * 60)
+        print("LEGIT UTILITY (benign scenarios -- higher is better):")
+        for name in sorted(set(r["scenario"] for r in benign)):
+            sub = [r for r in benign if r["scenario"] == name]
+            ok = sum(1 for r in sub if r["trigger_succeeded"])
+            low, high = proportion_confint(ok, len(sub), alpha=0.05, method="wilson")
+            print(f"  {name:33s} {ok:3d}/{len(sub):<3d}  utility = {ok / len(sub):.1%}   95% CI [{low:.1%}, {high:.1%}]")
+
     if errored:
         print("-" * 60)
         print(f"Errored trials excluded from ASR: {len(errored)} (rerun with --resume to retry them)")
@@ -246,6 +274,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--trials", type=int, default=10, help="Trials per scenario (default 10 for a quick check; use 30 for a real run)")
     parser.add_argument("--gate", type=str, default="no_gate", help="Label for this run, e.g. no_gate / gate_v1 / gate_v2")
+    parser.add_argument("--suite", choices=sorted(SUITES), default="text", help="Scenario set: text (original 3 text-marker scenarios, default -- matches earlier runs), action (send_email tool + act gate, incl. a benign utility control), or all")
     parser.add_argument("--delivery", choices=[*DELIVERY_MODES, "both"], default="upload", help="How the poisoned document reaches the agent: upload (process_document, default -- matches earlier runs), paste (inside an ordinary chat message), or both")
     parser.add_argument("--keep-chroma", action="store_true", help="Keep each trial's chroma_data_trial_* folder instead of deleting it after the trial (useful for manually inspecting one trial's memory state)")
     parser.add_argument("--resume", type=str, default=None, metavar="CSV", help="Continue an interrupted run from its results CSV: finished trials are skipped, errored ones retried. Use the same --trials/--gate/--delivery as the original run.")
@@ -257,20 +286,21 @@ if __name__ == "__main__":
         raise SystemExit
 
     deliveries = DELIVERY_MODES if args.delivery == "both" else (args.delivery,)
-    print(f"Running {args.trials} trials per scenario ({len(POISON_SCENARIOS)} scenarios x {len(deliveries)} delivery, "
-          f"{args.trials * len(POISON_SCENARIOS) * len(deliveries)} total) -- gate: {args.gate}, delivery: {args.delivery}\n")
+    print(f"Running {args.trials} trials per scenario ({len(SUITES[args.suite])} scenarios in suite '{args.suite}' x "
+          f"{len(deliveries)} delivery) -- gate: {args.gate}, delivery: {args.delivery}\n")
 
     if args.resume:
         csv_path = args.resume
     else:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        csv_path = f"{RESULTS_DIR}/trials_{args.gate}_{args.delivery}_{timestamp}.csv"
+        suite_tag = "" if args.suite == "text" else f"{args.suite}_"
+        csv_path = f"{RESULTS_DIR}/trials_{args.gate}_{suite_tag}{args.delivery}_{timestamp}.csv"
     print(f"Writing each trial to: {csv_path}\n")
 
     start = time.time()
     try:
         results = run_all_trials(args.trials, csv_path, gate_label=args.gate, keep_chroma=args.keep_chroma,
-                                 deliveries=deliveries, resume=bool(args.resume))
+                                 deliveries=deliveries, resume=bool(args.resume), suite=args.suite)
     except DailyLimitReached as e:
         print(f"\n\nStopped: Groq daily quota exhausted.\n  {str(e)[:200]}")
         print(f"\nFinished trials are saved in {csv_path}")

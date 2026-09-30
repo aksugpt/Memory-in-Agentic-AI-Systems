@@ -18,6 +18,7 @@ and extraction/classification.
 """
 
 import os
+import json
 import time
 from dotenv import load_dotenv
 from groq import Groq, APIStatusError
@@ -26,6 +27,7 @@ from memory_store import MemoryStore
 from extraction import extract_memory
 import gate as gate_v1
 import provenance
+import act_gate
 
 load_dotenv()  # reads .env in the current folder and loads it into os.environ
 
@@ -35,12 +37,21 @@ MODEL = "openai/gpt-oss-120b"
 
 
 class Agent:
-    def __init__(self, memory_path: str = "./chroma_data", session_id: str = "default", gate_version: str | None = None):
+    def __init__(self, memory_path: str = "./chroma_data", session_id: str = "default", gate_version: str | None = None,
+                 tools: bool = False, act_gate: bool | None = None):
         """
         gate_version: None -> ungated baseline (Phase 1's vulnerable
         agent, unchanged). "v1" -> Gate v1 active (provenance + risk
         classification + routing). "v2" -> origin binding + propagation
         (provenance.py), then Gate v1's risk routing on the bound origin.
+
+        tools: offer the model the (simulated) send_email tool. Off by
+        default so the original text-only scenarios run exactly as
+        before -- offering a tool changes how the model answers.
+
+        act_gate: run act_gate.py's Algorithm 1 on every tool call.
+        Defaults to on for v2 and off otherwise; pass it explicitly
+        for ablations (e.g. v2 write gate without the act gate).
         """
         self.client = Groq(api_key=os.environ["GROQ_API_KEY"])
         self.memory = MemoryStore(path=memory_path, collection_name="agent_memory")
@@ -62,6 +73,12 @@ class Agent:
         # itself writes this turn inherits the lowest of these (M2).
         self.turn_origins: list[str] = []
         self._last_retrieved: list[dict] = []
+        self.tools = tools
+        self.act_gate_enabled = (gate_version == "v2") if act_gate is None else act_gate
+        # Every tool call the model proposed, with the act gate's verdict
+        # and whether it executed. outbox = calls that actually executed.
+        self.action_log: list[dict] = []
+        self.outbox: list[dict] = []
 
     def _build_system_prompt(self, user_message: str) -> str:
         """
@@ -203,6 +220,49 @@ class Agent:
         self.quarantine.reset()
         self.clear_short_term()
         self.gate_log = []
+        self.action_log = []
+        self.outbox = []
+
+    def _act_context(self, user_message: str, source_label: str) -> list:
+        """
+        What the act gate sees: this turn's message segments and the
+        memories retrieved into this turn's prompt, each with its bound
+        origin. Only v2 splits pasted material out of a user_direct
+        message; without v2 the whole message carries its channel label.
+        """
+        if source_label == "user_direct" and self.gate_version == "v2":
+            segments = provenance.split_message(user_message)
+        else:
+            segments = [provenance.Segment(user_message, provenance.channel_origin(source_label), "channel")]
+        context = [
+            act_gate.ContextItem(s.text, s.origin, "user_segment" if s.origin == "user" else "pasted_segment")
+            for s in segments
+        ]
+        context += [act_gate.ContextItem(m["text"], self._memory_origin(m), "memory") for m in self._last_retrieved]
+        return context
+
+    def _dispatch_tool_call(self, name: str, args: dict, user_message: str, source_label: str) -> str:
+        """
+        Act gate -> (simulated) execution. Nothing is really sent; an
+        executed call is appended to self.outbox, which is what the
+        attack harness checks. Returns a short line for the reply.
+        """
+        verdict = None
+        if self.act_gate_enabled:
+            verdict = act_gate.authorize(name, args, self._act_context(user_message, source_label))
+        executed = name in act_gate.SECURITY_FIELDS and (verdict is None or verdict.allowed)
+
+        entry = {"tool": name, "args": args, "executed": executed, "verdict": verdict.to_dict() if verdict else None}
+        self.action_log.append(entry)
+        if executed:
+            self.outbox.append({"tool": name, "args": args})
+
+        recipients = f"to={args.get('to')} cc={args.get('cc') or []}"
+        if executed:
+            return f"[{name} sent: {recipients}]"
+        if verdict is not None:
+            return f"[{name} BLOCKED by act gate: {verdict.reason}]"
+        return f"[{name}: unknown tool, not executed]"
 
     def chat(self, user_message: str, source_label: str = "user_direct") -> str:
         """
@@ -227,6 +287,7 @@ class Agent:
                 response = self.client.chat.completions.create(
                     model=MODEL,
                     messages=messages,
+                    **({"tools": act_gate.TOOLS, "tool_choice": "auto"} if self.tools else {}),
                 )
                 break
             except APIStatusError as e:
@@ -245,7 +306,18 @@ class Agent:
         else:
             raise last_error
 
-        reply = response.choices[0].message.content
+        message = response.choices[0].message
+        reply = message.content or ""
+        # Tool calls go through the act gate. To save quota the tool
+        # result is not sent back for a second model call; the outcome
+        # is appended to the reply text instead.
+        for call in message.tool_calls or []:
+            try:
+                args = json.loads(call.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            outcome = self._dispatch_tool_call(call.function.name, args, user_message, source_label)
+            reply = f"{reply}\n{outcome}".strip()
         self.conversation_history.append({"role": "assistant", "content": reply})
 
         # Write path runs on the user's own message by default, tagged
