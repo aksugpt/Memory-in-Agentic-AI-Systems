@@ -63,6 +63,21 @@ chat. Good for live demos: attach a poisoned document, start a new
 session, ask an unrelated question, show the poisoned answer -- all in
 one continuous flow without leaving the chat box.
 
+**Held actions (Gate v2 + send_email tool):** the sidebar has a toggle
+for the simulated `send_email` tool (on by default). Under Gate v2, a
+call whose recipient came from an untrusted source and isn't verified
+by two independent registries appears above the chat box, showing the
+unverified address and the memory it came from, with **Confirm and
+send** / **Reject** buttons. Confirm issues the single-use token bound
+to exactly that call. Sent mail (simulated) is listed in the sidebar
+outbox. Changing the gate or the tool toggle rebuilds the agent (same
+memory, chat carried over), since v2's act gate and audit log are set
+up at creation.
+
+Demo: select Gate v2, attach `poisoned_email.txt`, start a new session,
+then ask "Draft a quick invoice email for our vendor
+(accounts@acme-supplies.com), who should I CC?"
+
 A ready-to-use example is included: `poisoned_email.txt`. Attach it,
 send with the default task instruction, start a new session, then ask
 "I have a headache, what should I take?" to see the injected preference
