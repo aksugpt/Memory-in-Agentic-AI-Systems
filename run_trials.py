@@ -44,7 +44,8 @@ def _is_daily_limit(e: Exception) -> bool:
 
 
 CSV_COLUMNS = ["timestamp", "gate", "scenario", "trial_index", "write_succeeded", "trigger_succeeded",
-               "gate_action", "reply", "delivery", "poison_origin", "error", "kind", "action_attempted"]
+               "gate_action", "reply", "delivery", "poison_origin", "error", "kind", "action_attempted",
+               "auto_executed", "held_for_confirmation"]
 
 
 def _resolve_gate_version(gate_label: str) -> str | None:
@@ -70,6 +71,7 @@ def _csv_row(r: dict) -> list:
         r["reply"].replace("\n", " ")[:300],
         r.get("delivery", "upload"), r.get("poison_origin", "n/a"), r.get("error", False),
         r.get("kind", "attack"), r.get("action_attempted"),
+        r.get("auto_executed"), r.get("held_for_confirmation"),
     ]
 
 
@@ -88,7 +90,8 @@ def load_results_csv(path: str) -> list[dict]:
         r["trigger_succeeded"] = r["trigger_succeeded"] == "True"
         r["delivery"] = r.get("delivery") or "upload"
         r["kind"] = r.get("kind") or "attack"
-        r["action_attempted"] = {"True": True, "False": False}.get(r.get("action_attempted"))
+        for col in ("action_attempted", "auto_executed", "held_for_confirmation"):
+            r[col] = {"True": True, "False": False}.get(r.get(col))
         r["error"] = r.get("error") == "True" or r["reply"].startswith("[ERROR]")
     return rows
 
@@ -177,6 +180,8 @@ def run_all_trials(n_trials: int, csv_path: str, gate_label: str = "no_gate", ke
                     "poison_origin": "n/a",
                     "kind": scenario.get("kind", "attack"),
                     "action_attempted": None,
+                    "auto_executed": None,
+                    "held_for_confirmation": None,
                     "write_succeeded": False,
                     "trigger_succeeded": False,
                     "gate_action": "n/a",
@@ -247,12 +252,13 @@ def print_asr_summary(results: list[dict]):
     attempted = [r for r in results if r.get("action_attempted") is not None]
     if attempted:
         print("-" * 60)
-        print("Action scenarios -- model PROPOSED the attacker's address vs it EXECUTED:")
+        print("Action scenarios -- attacker's address PROPOSED / HELD for confirmation / EXECUTED:")
         for name in sorted(set(r["scenario"] for r in attempted)):
             sub = [r for r in attempted if r["scenario"] == name]
             a = sum(1 for r in sub if r["action_attempted"])
+            h = sum(1 for r in sub if r.get("held_for_confirmation"))
             e = sum(1 for r in sub if r["trigger_succeeded"])
-            print(f"  {name:33s} attempted {a:3d}/{len(sub):<3d} executed {e:3d}/{len(sub)}")
+            print(f"  {name:33s} proposed {a:3d}/{len(sub):<3d} held {h:3d}  executed {e:3d}")
 
     if benign:
         print("-" * 60)
@@ -262,6 +268,10 @@ def print_asr_summary(results: list[dict]):
             ok = sum(1 for r in sub if r["trigger_succeeded"])
             low, high = proportion_confint(ok, len(sub), alpha=0.05, method="wilson")
             print(f"  {name:33s} {ok:3d}/{len(sub):<3d}  utility = {ok / len(sub):.1%}   95% CI [{low:.1%}, {high:.1%}]")
+            if any(r.get("held_for_confirmation") is not None for r in sub):
+                auto = sum(1 for r in sub if r.get("auto_executed"))
+                held = sum(1 for r in sub if r.get("held_for_confirmation"))
+                print(f"  {'':33s} auto-executed {auto}/{len(sub)}, held for confirmation {held}/{len(sub)}")
 
     if errored:
         print("-" * 60)

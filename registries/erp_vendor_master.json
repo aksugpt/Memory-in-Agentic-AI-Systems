@@ -1,0 +1,5 @@
+{
+  "principal": "ERP vendor master",
+  "domain": "erp.internal",
+  "entries": ["accounts@acme-supplies.com", "billing@acme-supplies.com", "ap@acme-supplies.com"]
+}

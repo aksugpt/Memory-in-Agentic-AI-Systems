@@ -1,0 +1,5 @@
+{
+  "principal": "CRM contacts",
+  "domain": "crm.internal",
+  "entries": ["accounts@acme-supplies.com", "billing@acme-supplies.com"]
+}

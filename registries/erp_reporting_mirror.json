@@ -1,0 +1,5 @@
+{
+  "principal": "ERP reporting mirror (same upstream as the vendor master -- NOT independent)",
+  "domain": "erp.internal",
+  "entries": ["ap@acme-supplies.com"]
+}

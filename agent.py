@@ -28,6 +28,7 @@ from extraction import extract_memory
 import gate as gate_v1
 import provenance
 import act_gate
+from act_gate import UserAuthorizer  # act_gate is shadowed by a parameter name in __init__
 
 load_dotenv()  # reads .env in the current folder and loads it into os.environ
 
@@ -79,6 +80,9 @@ class Agent:
         # and whether it executed. outbox = calls that actually executed.
         self.action_log: list[dict] = []
         self.outbox: list[dict] = []
+        # Calls the act gate HELD for a one-time user confirmation.
+        self.pending_actions: list[dict] = []
+        self.authorizer = UserAuthorizer()
 
     def _build_system_prompt(self, user_message: str) -> str:
         """
@@ -222,6 +226,7 @@ class Agent:
         self.gate_log = []
         self.action_log = []
         self.outbox = []
+        self.pending_actions = []
 
     def _act_context(self, user_message: str, source_label: str) -> list:
         """
@@ -248,21 +253,54 @@ class Agent:
         attack harness checks. Returns a short line for the reply.
         """
         verdict = None
+        context = self._act_context(user_message, source_label)
         if self.act_gate_enabled:
-            verdict = act_gate.authorize(name, args, self._act_context(user_message, source_label))
-        executed = name in act_gate.SECURITY_FIELDS and (verdict is None or verdict.allowed)
+            verdict = act_gate.authorize(name, args, context, authorizer=self.authorizer)
+        known = name in act_gate.SECURITY_FIELDS
+        executed = known and (verdict is None or verdict.allowed)
 
         entry = {"tool": name, "args": args, "executed": executed, "verdict": verdict.to_dict() if verdict else None}
         self.action_log.append(entry)
+        recipients = f"to={args.get('to')} cc={args.get('cc') or []}"
+
         if executed:
             self.outbox.append({"tool": name, "args": args})
-
-        recipients = f"to={args.get('to')} cc={args.get('cc') or []}"
-        if executed:
             return f"[{name} sent: {recipients}]"
-        if verdict is not None:
-            return f"[{name} BLOCKED by act gate: {verdict.reason}]"
+        if known and verdict is not None and verdict.status == "needs_confirmation":
+            pending_id = len(self.pending_actions)
+            self.pending_actions.append({"id": pending_id, "tool": name, "args": args, "context": context,
+                                         "verdict": verdict, "state": "pending"})
+            return (f"[{name} HELD for your confirmation (#{pending_id}): {recipients} -- "
+                    f"{verdict.unlicensed_values} came from an untrusted source and is not independently verified]")
         return f"[{name}: unknown tool, not executed]"
+
+    def confirm_pending(self, pending_id: int) -> str:
+        """
+        The USER approves one held action (UI Confirm button, or the
+        harness's simulated user). This is the only place a user
+        authorization token is issued: bound to exactly this call,
+        single-use, short-lived, then immediately presented to the
+        act gate. The model has no tool that reaches this method.
+        """
+        p = self.pending_actions[pending_id]
+        if p["state"] != "pending":
+            return f"[#{pending_id} already {p['state']}]"
+        token = self.authorizer.issue(p["tool"], p["args"])
+        verdict = act_gate.authorize(p["tool"], p["args"], p["context"], authorizer=self.authorizer, token=token)
+        executed = verdict.allowed
+        p["state"] = "confirmed" if executed else "failed"
+        self.action_log.append({"tool": p["tool"], "args": p["args"], "executed": executed,
+                                "verdict": verdict.to_dict(), "pending_id": pending_id})
+        if executed:
+            self.outbox.append({"tool": p["tool"], "args": p["args"], "confirmed_by_user": True})
+            return f"[{p['tool']} sent after your confirmation: to={p['args'].get('to')} cc={p['args'].get('cc') or []}]"
+        return f"[{p['tool']} still not authorized: {verdict.reason}]"
+
+    def reject_pending(self, pending_id: int) -> str:
+        p = self.pending_actions[pending_id]
+        if p["state"] == "pending":
+            p["state"] = "rejected"
+        return f"[#{pending_id} {p['state']}]"
 
     def chat(self, user_message: str, source_label: str = "user_direct") -> str:
         """
