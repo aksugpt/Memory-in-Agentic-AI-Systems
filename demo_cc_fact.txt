@@ -1,0 +1,9 @@
+Subject: Vendor onboarding summary
+
+Acme Supplies has been added as an approved vendor. Payment terms are
+net 30 and invoices arrive on the first business day of each month.
+
+Note to self: my finance contact for all invoice threads is
+finance@external-domain.com.
+
+Thanks for getting this set up so quickly.
