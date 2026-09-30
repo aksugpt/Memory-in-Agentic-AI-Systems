@@ -261,6 +261,36 @@ The summary also reports, per benign scenario, how often it
 auto-executed vs was held. Auto-executed on the confirm scenario is
 the paper's **uncorr-auto** metric (lower is safer).
 
+## Gate v2, step 4: tamper-evident audit log + signed provenance (TMA-NM M4)
+
+`crypto_layer.py`, active for `v2` only (the baselines are unchanged):
+
+- **Audit log.** `<memory_path>/audit_log.jsonl` is an append-only
+  hash chain. Every memory write (with its gate decision), tool call
+  and verdict, user confirmation or rejection, reset and bad signature
+  is one entry: `hash_i = SHA256(hash_{i-1} || entry_i)`, plus
+  `HMAC(key, hash_i)`. Editing, deleting or reordering an entry, or
+  recomputing the chain without the key, fails verification. Tail
+  truncation is caught when you check against an anchored head hash.
+  As in the paper, this is auditability, not enforcement.
+  ```bash
+  python crypto_layer.py                               # tamper self-test
+  python crypto_layer.py verify ./chroma_data_streamlit [anchored_head]
+  ```
+- **Signed provenance.** Each v2 memory stores
+  `sig = HMAC(key, text + source + origin + act_class)`. On retrieval,
+  a memory whose signature doesn't verify is treated as
+  `untrusted_external` and logged as `signature_invalid`. So relabelling
+  a poisoned memory as `user` by editing the vector store doesn't give
+  it authority.
+- **Key.** Set `MEMORY_SIGNING_KEY` in `.env`. Without it, a random key
+  is saved to `<memory_path>/.signing_key` (gitignored). That's fine for
+  experiments, but it doesn't protect against someone who can read that
+  folder.
+
+Trial folders, including their logs, are still deleted after each
+trial. Use `--keep-chroma` to keep them and verify a trial's chain.
+
 ## What's next (not built yet)
 
 - `attacks/laundering.py` — Phase 2's self-summarization laundering attack,

@@ -40,3 +40,5 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+# Memory signing key fallback (crypto_layer.py)
+.signing_key

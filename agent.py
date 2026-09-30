@@ -27,6 +27,7 @@ from memory_store import MemoryStore
 from extraction import extract_memory
 import gate as gate_v1
 import provenance
+import crypto_layer
 import act_gate
 from act_gate import UserAuthorizer  # act_gate is shadowed by a parameter name in __init__
 
@@ -83,6 +84,12 @@ class Agent:
         # Calls the act gate HELD for a one-time user confirmation.
         self.pending_actions: list[dict] = []
         self.authorizer = UserAuthorizer()
+        # v2 only (step 4): memory provenance is HMAC-signed, and every
+        # write / verdict / confirmation goes into a hash-chained audit
+        # log next to the store. Baselines stay untouched.
+        self._signing_key = crypto_layer.load_key(memory_path) if gate_version == "v2" else None
+        self.audit = (crypto_layer.AuditLog(os.path.join(memory_path, "audit_log.jsonl"), self._signing_key)
+                      if gate_version == "v2" else None)
 
     def _build_system_prompt(self, user_message: str) -> str:
         """
@@ -139,12 +146,22 @@ class Agent:
 
         raise ValueError(f"Unknown gate_version: {self.gate_version!r}")
 
-    @staticmethod
-    def _memory_origin(m: dict) -> str:
+    def _audit(self, event: str, data: dict):
+        if self.audit is not None:
+            self.audit.append(event, data)
+
+    def _memory_origin(self, m: dict) -> str:
         # Memories written before v2 have no origin field -- derive it
         # from their channel label (fail-safe: unknown -> untrusted).
-        meta = m.get("metadata") or {}
-        return meta.get("origin") or provenance.channel_origin(meta.get("source", ""))
+        text, meta = m.get("text", ""), m.get("metadata") or {}
+        if "origin" not in meta:
+            return provenance.channel_origin(meta.get("source", ""))
+        # Under v2 an origin label only counts if its signature checks
+        # out; a store edited to relabel a memory "user" is untrusted.
+        if self._signing_key is not None and not crypto_layer.verify_memory(self._signing_key, text, meta):
+            self._audit("signature_invalid", {"text": text[:200], "claimed_origin": meta.get("origin")})
+            return "untrusted_external"
+        return meta["origin"]
 
     def _write_path_v2(self, source_text: str, source_label: str):
         """
@@ -195,6 +212,10 @@ class Agent:
         act = provenance.act_class(origin)
         decision = gate_v1.evaluate(text, origin)
         meta = {"source": source_label, "origin": origin, "act_class": act, "gate_action": decision.action}
+        if self._signing_key is not None:
+            meta["sig"] = crypto_layer.sign_memory(self._signing_key, text, meta)
+        self._audit("memory_write", {"text": text, "source": source_label, "origin": origin, "act_class": act,
+                                     "action": decision.action, "risk": decision.risk, "provenance": reason})
         self.gate_log.append({"text": text, "source": source_label, "origin": origin, "act_class": act,
                               "provenance": reason, **decision.to_dict()})
 
@@ -223,6 +244,8 @@ class Agent:
         self.memory.reset()
         self.quarantine.reset()
         self.clear_short_term()
+        # The audit log is append-only: a reset is recorded, not erased.
+        self._audit("memory_reset", {})
         self.gate_log = []
         self.action_log = []
         self.outbox = []
@@ -261,6 +284,8 @@ class Agent:
 
         entry = {"tool": name, "args": args, "executed": executed, "verdict": verdict.to_dict() if verdict else None}
         self.action_log.append(entry)
+        self._audit("tool_call", {"tool": name, "args": args, "executed": executed,
+                                  "verdict": entry["verdict"]})
         recipients = f"to={args.get('to')} cc={args.get('cc') or []}"
 
         if executed:
@@ -289,6 +314,8 @@ class Agent:
         verdict = act_gate.authorize(p["tool"], p["args"], p["context"], authorizer=self.authorizer, token=token)
         executed = verdict.allowed
         p["state"] = "confirmed" if executed else "failed"
+        self._audit("user_confirmation", {"pending_id": pending_id, "tool": p["tool"], "args": p["args"],
+                                          "executed": executed, "reason": verdict.reason})
         self.action_log.append({"tool": p["tool"], "args": p["args"], "executed": executed,
                                 "verdict": verdict.to_dict(), "pending_id": pending_id})
         if executed:
@@ -300,6 +327,7 @@ class Agent:
         p = self.pending_actions[pending_id]
         if p["state"] == "pending":
             p["state"] = "rejected"
+            self._audit("user_rejection", {"pending_id": pending_id, "tool": p["tool"], "args": p["args"]})
         return f"[#{pending_id} {p['state']}]"
 
     def chat(self, user_message: str, source_label: str = "user_direct") -> str:
