@@ -24,7 +24,7 @@ from dotenv import load_dotenv
 from groq import Groq, APIStatusError
 
 from memory_store import MemoryStore
-from extraction import extract_memory
+from extraction import extract_memory, MODEL as NOTE_MODEL
 import gate as gate_v1
 import provenance
 import crypto_layer
@@ -37,11 +37,21 @@ load_dotenv()  # reads .env in the current folder and loads it into os.environ
 # is their official recommended replacement for higher-quality chat replies.
 MODEL = "openai/gpt-oss-120b"
 
+# The agent's own note-taking (save_session_note) uses the cheaper
+# extraction model, as memory frameworks like Mem0 do for
+# consolidation -- and so it doesn't spend the chat model's quota.
+NOTE_PROMPT = (
+    "You are the note-taking module of an assistant with long-term memory. From the conversation "
+    "above, write ONE short note, in your own words, of anything about the user worth remembering "
+    "for future sessions (contacts, preferences, standing arrangements). Reply with only the note, "
+    "or NONE if there is nothing worth keeping."
+)
+
 
 class Agent:
     def __init__(self, memory_path: str = "./chroma_data", session_id: str = "default", gate_version: str | None = None,
                  tools: bool = False, act_gate: bool | None = None,
-                 paste_split: bool = True, k: int = 2, elevation: bool = True):
+                 paste_split: bool = True, k: int = 2, elevation: bool = True, propagation: bool = True):
         """
         gate_version: None -> ungated baseline (Phase 1's vulnerable
         agent, unchanged). "v1" -> Gate v1 active (provenance + risk
@@ -61,6 +71,9 @@ class Agent:
                          messages (off: whole message keeps the channel label)
           k           -- independent trusted domains needed to elevate
                          an untrusted value (k=1 is the insecure single-source point)
+          propagation -- M2: derived items (agent notes, trusted-tool
+                         output) inherit the lowest origin of their inputs
+                         (off: they keep the label of whoever wrote them)
           elevation   -- consult the trusted registries at all (off:
                          every untrusted value needs user confirmation)
         """
@@ -89,6 +102,11 @@ class Agent:
         self.paste_split = paste_split
         self.k = k
         self.elevation = elevation
+        self.propagation = propagation
+        # v2: every origin that has fed this session's conversation so
+        # far. The agent's own notes are derived from the whole
+        # conversation, so they inherit the lowest of these (M2).
+        self.session_origins: list[str] = []
         # Every tool call the model proposed, with the act gate's verdict
         # and whether it executed. outbox = calls that actually executed.
         self.action_log: list[dict] = []
@@ -197,6 +215,7 @@ class Agent:
             segments = [provenance.Segment(source_text, origin, f"channel '{source_label}'")]
 
         self.turn_origins = [s.origin for s in segments] + [self._memory_origin(m) for m in self._last_retrieved]
+        self.session_origins.extend(self.turn_origins)
 
         written = []
         for seg in segments:
@@ -214,11 +233,68 @@ class Agent:
         everything that fed this turn (M2), so summarizing a poisoned
         document cannot launder it into a trusted memory (L-a).
         """
+        return self._write_derived(text, "agent_note", self.session_origins, own_origin="agent")
+
+    def save_session_note(self) -> str | None:
+        """
+        The agent summarizes this session into its own note and saves
+        it (the self-summarization laundering channel, L-a). The note
+        is written in the agent's words, so a poisoned instruction can
+        come out looking like a harmless fact.
+        """
+        messages = self.conversation_history + [{"role": "user", "content": NOTE_PROMPT}]
+        last_error = None
+        for attempt in range(4):
+            try:
+                response = self.client.chat.completions.create(model=NOTE_MODEL, messages=messages, temperature=0)
+                break
+            except APIStatusError as e:
+                if e.status_code == 429 or 500 <= e.status_code < 600:
+                    last_error = e
+                    time.sleep(2 ** attempt)
+                else:
+                    raise
+        else:
+            raise last_error
+        note = (response.choices[0].message.content or "").strip()
+        if not note or note.upper().rstrip(".") == "NONE":
+            return None
+        self.write_agent_note(note)
+        return note
+
+    def ingest_via_trusted_tool(self, tool_name: str, tool_fn, input_text: str, input_origin: str) -> list[str]:
+        """
+        Run a TRUSTED tool (e.g. a CRM importer) on some input and save
+        what it returns. The output arrives on the trusted_tool
+        channel -- but if the input was untrusted, the output is just
+        the attacker's content echoed back (L-b). Under v2 the output
+        inherits the input's untrust at the call boundary (M2).
+        """
+        records = tool_fn(input_text)
+        self._audit("trusted_tool_call", {"tool": tool_name, "input_origin": input_origin, "records": records})
+        for record in records:
+            self._write_derived(record, "trusted_tool", [input_origin], own_origin="trusted_tool")
+        return records
+
+    def _write_derived(self, text: str, source_label: str, input_origins: list[str], own_origin: str):
+        """
+        Write path for content the agent or a tool DERIVED from other
+        inputs. Baselines only see the channel label, so this is just
+        the normal write path for them. Under v2 the origin is the
+        lowest of (inputs + the writer's own label) when propagation
+        is on (M2), or just the writer's label when it's off.
+        """
         if self.gate_version != "v2":
-            self.memory.write(text, metadata={"source": "agent_note"})
-            return
-        origin = provenance.derive_origin(self.turn_origins)
-        self._commit_v2(text, origin, "agent_note", f"derived from {sorted(set(self.turn_origins))}")
+            return self._write_path(text, source_label)
+        extracted = extract_memory(text)
+        if not extracted:
+            return None
+        if self.propagation:
+            origin = provenance.derive_origin(list(input_origins) + [own_origin])
+            reason = f"{source_label} derived from {sorted(set(input_origins))}"
+        else:
+            origin, reason = own_origin, f"{source_label} (propagation off)"
+        return self._commit_v2(extracted, origin, source_label, reason)
 
     def _commit_v2(self, text: str, origin: str, source_label: str, reason: str) -> str:
         act = provenance.act_class(origin)
@@ -245,6 +321,7 @@ class Agent:
         "start a fresh conversation, keep what's been remembered" flows.
         """
         self.conversation_history = []
+        self.session_origins = []
 
     def reset_all_memory(self):
         """

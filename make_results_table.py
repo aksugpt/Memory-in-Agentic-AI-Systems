@@ -39,10 +39,12 @@ from scipy.stats import fisher_exact
 from statsmodels.stats.proportion import proportion_confint
 
 from attacks.indirect_injection import ACTION_SCENARIOS, POISON_SCENARIOS
+from attacks.laundering import LAUNDERING_SCENARIOS
 from run_trials import CONFIGS, load_results_csv
 
 RESULTS_DIR = "./results"
 TEXT_NAMES = {s["name"] for s in POISON_SCENARIOS}
+LAUNDERING_NAMES = {s["name"] for s in LAUNDERING_SCENARIOS}
 CONFIRM_NAMES = {s["name"] for s in ACTION_SCENARIOS if s.get("user_confirms")}
 CONFIG_ORDER = {name: i for i, name in enumerate(CONFIGS)}
 
@@ -70,7 +72,8 @@ def load_groups(all_files: bool) -> tuple[dict, dict]:
         for r in load_results_csv(path):
             if r["error"]:
                 continue
-            suite = "text" if r["scenario"] in TEXT_NAMES else "action"
+            suite = ("text" if r["scenario"] in TEXT_NAMES
+                     else "laundering" if r["scenario"] in LAUNDERING_NAMES else "action")
             key = (r["gate"], suite, r["delivery"])
             by_key.setdefault(key, {}).setdefault(path, []).append(r)
 
@@ -110,7 +113,8 @@ def main():
 
     def sort_key(key):
         gate, suite, delivery = key[:3]
-        return (suite != "text", delivery, CONFIG_ORDER.get(gate, 99), key[3:] if len(key) > 3 else ())
+        suite_rank = {"text": 0, "action": 1, "laundering": 2}.get(suite, 3)
+        return (suite_rank, delivery, CONFIG_ORDER.get(gate, 99), key[3:] if len(key) > 3 else ())
 
     header = ["suite", "delivery", "config", "ASR (attacks)", "p vs no_gate", "legit utility", "uncorr-auto", "file"]
     table, notes = [], []

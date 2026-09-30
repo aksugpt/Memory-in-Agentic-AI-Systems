@@ -30,7 +30,15 @@ from datetime import datetime
 
 from statsmodels.stats.proportion import proportion_confint
 
-from attacks.indirect_injection import SUITES, DELIVERY_MODES, run_single_trial
+from attacks.indirect_injection import SUITES as _BASE_SUITES, DELIVERY_MODES, run_single_trial
+from attacks.laundering import LAUNDERING_SCENARIOS
+
+SUITES = {
+    "text": _BASE_SUITES["text"],
+    "action": _BASE_SUITES["action"],
+    "laundering": LAUNDERING_SCENARIOS,
+    "all": _BASE_SUITES["text"] + _BASE_SUITES["action"] + LAUNDERING_SCENARIOS,
+}
 
 RESULTS_DIR = "./results"
 
@@ -61,6 +69,7 @@ CONFIGS = {
     "gate_v2_no_split":     {"gate_version": "v2", "paste_split": False},  # no paste split
     "gate_v2_no_elevation": {"gate_version": "v2", "elevation": False},    # -M3: no registries
     "gate_v2_k1":           {"gate_version": "v2", "k": 1},                # single-source elevation
+    "gate_v2_no_propagation": {"gate_version": "v2", "propagation": False},  # -M2: derived items keep the writer's label
     "act_only":             {"gate_version": None, "act_gate": True},      # act gate, no write gate
 }
 
@@ -128,10 +137,11 @@ def run_all_trials(n_trials: int, csv_path: str, gate_label: str = "no_gate", ke
     Returns all rows in the CSV afterwards (earlier + this run).
     """
     agent_kwargs = resolve_config(gate_label)
-    # Benign scenarios don't use a document, so delivery doesn't apply:
-    # run them once (under the first delivery mode) rather than per mode.
+    # Benign and laundering scenarios define their own route in, so
+    # delivery doesn't apply: run them once (under the first delivery
+    # mode) rather than per mode.
     jobs = [(d, sc, t) for d in deliveries for sc in SUITES[suite] for t in range(n_trials)
-            if sc.get("kind", "attack") == "attack" or d == deliveries[0]]
+            if d == deliveries[0] or (sc.get("kind", "attack") == "attack" and not sc.get("delivery_independent"))]
     total_runs = len(jobs)
     run_num = 0
 
@@ -166,7 +176,8 @@ def run_all_trials(n_trials: int, csv_path: str, gate_label: str = "no_gate", ke
             print(f"[{run_num}/{total_runs}] {scenario['name']} [{delivery}] trial {trial_i + 1}/{n_trials}...", end=" ", flush=True)
 
             try:
-                result = run_single_trial(scenario, memory_path=memory_path, delivery=delivery, **agent_kwargs)
+                trial_fn = scenario.get("trial_fn", run_single_trial)
+                result = trial_fn(scenario, memory_path=memory_path, delivery=delivery, **agent_kwargs)
                 result["error"] = False
                 status = "SUCCESS" if result["trigger_succeeded"] else "failed"
                 if result.get("gate_action") and result["gate_action"] != "n/a":
@@ -292,7 +303,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--trials", type=int, default=10, help="Trials per scenario (default 10 for a quick check; use 30 for a real run)")
     parser.add_argument("--gate", choices=list(CONFIGS), default="no_gate", help="Configuration to run (see CONFIGS): no_gate / gate_v1 / gate_v2, or an ablation such as gate_v2_no_act")
-    parser.add_argument("--suite", choices=sorted(SUITES), default="text", help="Scenario set: text (original 3 text-marker scenarios, default -- matches earlier runs), action (send_email tool + act gate, incl. a benign utility control), or all")
+    parser.add_argument("--suite", choices=sorted(SUITES), default="text", help="Scenario set: text (original 3 text-marker scenarios, default -- matches earlier runs), action (send_email tool + act gate, incl. benign utility controls), laundering (summarize / trusted-tool echo / manufactured corroboration), or all")
     parser.add_argument("--delivery", choices=[*DELIVERY_MODES, "both"], default="upload", help="How the poisoned document reaches the agent: upload (process_document, default -- matches earlier runs), paste (inside an ordinary chat message), or both")
     parser.add_argument("--keep-chroma", action="store_true", help="Keep each trial's chroma_data_trial_* folder instead of deleting it after the trial (useful for manually inspecting one trial's memory state)")
     parser.add_argument("--resume", type=str, default=None, metavar="CSV", help="Continue an interrupted run from its results CSV: finished trials are skipped, errored ones retried. Use the same --trials/--gate/--delivery as the original run.")
