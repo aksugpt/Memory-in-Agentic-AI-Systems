@@ -23,11 +23,13 @@ Usage:
 
 import argparse
 import csv
+import gc
 import os
 import shutil
 import time
 from datetime import datetime
 
+from chromadb.api.client import SharedSystemClient
 from statsmodels.stats.proportion import proportion_confint
 
 from attacks.indirect_injection import SUITES as _BASE_SUITES, DELIVERY_MODES, run_single_trial
@@ -111,6 +113,28 @@ def load_results_csv(path: str) -> list[dict]:
             r[col] = {"True": True, "False": False}.get(r.get(col))
         r["error"] = r.get("error") == "True" or r["reply"].startswith("[ERROR]")
     return rows
+
+
+def _release_trial_resources(memory_path: str, keep_chroma: bool):
+    """
+    ChromaDB caches every PersistentClient's system process-wide and
+    never closes it, so each trial's SQLite/index files stayed open.
+    After ~127 trials that hit Windows' per-process limit (512) and
+    every later trial failed with "[Errno 24] Too many open files";
+    the still-open files also made the folder deletion below fail
+    silently. Stopping the cached systems closes those files.
+    """
+    SharedSystemClient.clear_system_cache()
+    gc.collect()
+    if keep_chroma:
+        return
+    # Windows can hold a just-closed file for a moment (antivirus or
+    # indexer scanning it), so retry the delete briefly.
+    for attempt in range(5):
+        shutil.rmtree(memory_path, ignore_errors=True)
+        if not os.path.exists(memory_path):
+            return
+        time.sleep(0.2 * (attempt + 1))
 
 
 def run_all_trials(n_trials: int, csv_path: str, gate_label: str = "no_gate", keep_chroma: bool = False,
@@ -215,8 +239,7 @@ def run_all_trials(n_trials: int, csv_path: str, gate_label: str = "no_gate", ke
             f.flush()
             all_results.append(result)
 
-            if not keep_chroma and os.path.exists(memory_path):
-                shutil.rmtree(memory_path, ignore_errors=True)
+            _release_trial_resources(memory_path, keep_chroma)
 
     print(f"\nRaw trial log saved to: {csv_path}")
     return all_results
