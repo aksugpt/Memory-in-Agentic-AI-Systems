@@ -163,18 +163,21 @@ class Agent:
             return extracted
 
         if self.gate_version == "v1":
-            decision = gate_v1.evaluate(extracted, source_label)
-            self.gate_log.append({"text": extracted, "source": source_label, **decision.to_dict()})
-
-            if decision.action == "auto_write":
-                self.memory.write(extracted, metadata={"source": source_label, "gate_action": decision.action})
-            elif decision.action == "quarantine":
-                self.quarantine.write(extracted, metadata={"source": source_label, "gate_action": decision.action, "risk": decision.risk})
-            elif decision.action == "block":
-                pass  # not written anywhere; only logged in self.gate_log
-            return extracted
+            return self._commit_v1(extracted, source_label)
 
         raise ValueError(f"Unknown gate_version: {self.gate_version!r}")
+
+    def _commit_v1(self, extracted: str, source_label: str) -> str:
+        decision = gate_v1.evaluate(extracted, source_label)
+        self.gate_log.append({"text": extracted, "source": source_label, **decision.to_dict()})
+
+        if decision.action == "auto_write":
+            self.memory.write(extracted, metadata={"source": source_label, "gate_action": decision.action})
+        elif decision.action == "quarantine":
+            self.quarantine.write(extracted, metadata={"source": source_label, "gate_action": decision.action, "risk": decision.risk})
+        elif decision.action == "block":
+            pass  # not written anywhere; only logged in self.gate_log
+        return extracted
 
     def _audit(self, event: str, data: dict):
         if self.audit is not None:
@@ -269,26 +272,44 @@ class Agent:
         channel -- but if the input was untrusted, the output is just
         the attacker's content echoed back (L-b). Under v2 the output
         inherits the input's untrust at the call boundary (M2).
+
+        Records are written as-is, without the LLM extraction step: an
+        import writes the records it produced, it doesn't ask a model
+        whether they're worth remembering. (Routing them through
+        extraction dropped 29/30 records in the first gate_v1 run, so
+        the attack never reached any gate.)
         """
         records = tool_fn(input_text)
         self._audit("trusted_tool_call", {"tool": tool_name, "input_origin": input_origin, "records": records})
         for record in records:
-            self._write_derived(record, "trusted_tool", [input_origin], own_origin="trusted_tool")
+            self._write_derived(record, "trusted_tool", [input_origin], own_origin="trusted_tool", extract=False)
         return records
 
-    def _write_derived(self, text: str, source_label: str, input_origins: list[str], own_origin: str):
+    def _write_derived(self, text: str, source_label: str, input_origins: list[str], own_origin: str,
+                       extract: bool = True):
         """
         Write path for content the agent or a tool DERIVED from other
         inputs. Baselines only see the channel label, so this is just
         the normal write path for them. Under v2 the origin is the
         lowest of (inputs + the writer's own label) when propagation
         is on (M2), or just the writer's label when it's off.
+
+        extract=False writes `text` as the candidate memory directly
+        (structured tool output) instead of running extraction on it.
         """
-        if self.gate_version != "v2":
-            return self._write_path(text, source_label)
-        extracted = extract_memory(text)
-        if not extracted:
-            return None
+        if extract:
+            if self.gate_version != "v2":
+                return self._write_path(text, source_label)
+            extracted = extract_memory(text)
+            if not extracted:
+                return None
+        else:
+            extracted = text
+            if self.gate_version is None:
+                self.memory.write(extracted, metadata={"source": source_label})
+                return extracted
+            if self.gate_version == "v1":
+                return self._commit_v1(extracted, source_label)
         if self.propagation:
             origin = provenance.derive_origin(list(input_origins) + [own_origin])
             reason = f"{source_label} derived from {sorted(set(input_origins))}"
